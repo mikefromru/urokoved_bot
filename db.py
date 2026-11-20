@@ -22,6 +22,8 @@ CREATE TABLE IF NOT EXISTS students (
     contact   TEXT,
     price     INTEGER NOT NULL DEFAULT 0,  -- цена одного урока
     currency  TEXT NOT NULL DEFAULT 'RUB', -- валюта цены: RUB, KZT, USD...
+    subject   TEXT,                        -- предмет, необязательно
+    duration  INTEGER NOT NULL DEFAULT 0,  -- длительность урока в минутах, 0 = не указана
     active    INTEGER NOT NULL DEFAULT 1
 );
 
@@ -91,6 +93,10 @@ class DB:
         cols = {r["name"] for r in await self._all("PRAGMA table_info(students)")}
         if "currency" not in cols:
             await self.conn.execute("ALTER TABLE students ADD COLUMN currency TEXT NOT NULL DEFAULT 'RUB'")
+        if "subject" not in cols:
+            await self.conn.execute("ALTER TABLE students ADD COLUMN subject TEXT")
+        if "duration" not in cols:
+            await self.conn.execute("ALTER TABLE students ADD COLUMN duration INTEGER NOT NULL DEFAULT 0")
 
     async def close(self):
         if self.conn:
@@ -171,16 +177,17 @@ class DB:
     # ---------- ученики ----------
 
     async def add_student(self, tutor_id: int, name: str, contact: str | None, price: int,
-                          currency: str = "RUB") -> int:
+                          currency: str = "RUB", subject: str | None = None, duration: int = 0) -> int:
         cur = await self.conn.execute(
-            "INSERT INTO students(tutor_id, name, contact, price, currency) VALUES (?, ?, ?, ?, ?)",
-            (tutor_id, name, contact, price, currency),
+            "INSERT INTO students(tutor_id, name, contact, price, currency, subject, duration) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (tutor_id, name, contact, price, currency, subject, duration),
         )
         await self.conn.commit()
         return cur.lastrowid
 
     async def student(self, student_id: int, tutor_id: int):
-        """Всегда проверяем владельца: репетитор видит только своих учеников."""
+        """Ученик с проверкой владельца: репетитору доступны только его собственные ученики."""
         return await self._one(
             "SELECT * FROM students WHERE id = ? AND tutor_id = ?", (student_id, tutor_id)
         )
@@ -210,6 +217,14 @@ class DB:
 
     async def set_contact(self, student_id: int, contact: str | None):
         await self.conn.execute("UPDATE students SET contact = ? WHERE id = ?", (contact, student_id))
+        await self.conn.commit()
+
+    async def set_subject(self, student_id: int, subject: str | None):
+        await self.conn.execute("UPDATE students SET subject = ? WHERE id = ?", (subject, student_id))
+        await self.conn.commit()
+
+    async def set_duration(self, student_id: int, minutes: int):
+        await self.conn.execute("UPDATE students SET duration = ? WHERE id = ?", (minutes, student_id))
         await self.conn.commit()
 
     async def set_name(self, student_id: int, name: str):
@@ -302,7 +317,7 @@ class DB:
 
     async def lessons_on(self, tutor_id: int, day: date):
         return await self._all(
-            "SELECT l.*, s.name, s.contact, s.price, sl.time AS slot_time FROM lessons l "
+            "SELECT l.*, s.name, s.contact, s.price, s.subject, s.duration, sl.time AS slot_time FROM lessons l "
             "JOIN students s ON s.id = l.student_id LEFT JOIN slots sl ON sl.id = l.slot_id "
             "WHERE s.tutor_id = ? AND s.active = 1 AND l.day = ? ORDER BY l.time",
             (tutor_id, day.isoformat()),
@@ -310,7 +325,7 @@ class DB:
 
     async def lesson(self, lesson_id: int, tutor_id: int):
         return await self._one(
-            "SELECT l.*, s.name, s.contact, s.price, sl.time AS slot_time FROM lessons l "
+            "SELECT l.*, s.name, s.contact, s.price, s.subject, s.duration, sl.time AS slot_time FROM lessons l "
             "JOIN students s ON s.id = l.student_id LEFT JOIN slots sl ON sl.id = l.slot_id "
             "WHERE l.id = ? AND s.tutor_id = ?",
             (lesson_id, tutor_id),

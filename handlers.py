@@ -14,7 +14,7 @@ from aiogram.types import CallbackQuery, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 
 from db import DB
-from utils import (CURRENT_TZ, CURRENCIES, TIMEZONES, WEEKDAYS, tz_label, WEEKDAYS_FULL, day_title, now_key, fmt_day, fmt_money, fmt_phone, plural, now, parse_slots,
+from utils import (CURRENT_TZ, CURRENCIES, TIMEZONES, WEEKDAYS, tz_label, WEEKDAYS_FULL, day_title, now_key, fmt_day, fmt_money, fmt_phone, plural, now,
                    parse_time, whatsapp_phone)
 
 router = Router()
@@ -76,6 +76,18 @@ class CurCb(CallbackData, prefix="cur"):
     price: int = 0
 
 
+class DurCb(CallbackData, prefix="dur"):
+    """Выбор длительности урока."""
+    mode: str          # new — при добавлении ученика, edit — в карточке ученика
+    minutes: int       # 0 = длительность не указана
+    sid: int = 0
+
+
+class SkipCb(CallbackData, prefix="skip"):
+    """Кнопка «Пропустить» на необязательных шагах добавления ученика."""
+    step: str          # subject | contact | price
+
+
 class SetCb(CallbackData, prefix="set"):
     """Настройки."""
     action: str        # open | on | off | time | h | m | tz | tzset
@@ -92,15 +104,17 @@ MINUTES = (0, 15, 30, 45)
 
 class AddStudent(StatesGroup):
     name = State()
+    subject = State()
     contact = State()
     price = State()
     currency = State()
+    duration = State()
 
 
 class Ask(StatesGroup):
-    """Одношаговые вопросы; что делать с ответом — лежит в data['target']."""
-    slots = State()
+    """Одношаговые вопросы; id ученика, к которому относится ответ, хранится в data['target']."""
     price = State()
+    subject = State()
     contact = State()
     name = State()
 
@@ -125,12 +139,61 @@ def currency_kb(mode: str, current: str | None = None, sid: int = 0, price: int 
     return kb.as_markup()
 
 
+DURATIONS = (30, 45, 60, 90, 120)
+
+
+def fmt_duration(minutes: int) -> str:
+    """45 -> '45 мин', 60 -> '1 ч', 90 -> '1 ч 30 мин'."""
+    h, m = divmod(minutes, 60)
+    if not h:
+        return f"{m} мин"
+    return f"{h} ч" + (f" {m} мин" if m else "")
+
+
+def time_range(start: str, minutes: int) -> str:
+    """'08:00', 45 -> '08:00–08:45'; без длительности — только время начала."""
+    if not minutes:
+        return start
+    h, m = map(int, start.split(":"))
+    end = (h * 60 + m + minutes) % (24 * 60)
+    return f"{start}–{end // 60:02d}:{end % 60:02d}"
+
+
+def lesson_line(l, strike: bool = False) -> str:
+    """Строка урока для дня, недели и сводки: время (с концом урока), имя и предмет."""
+    when = time_range(l["time"], l["duration"])
+    who = escape(l["name"])
+    subject = f" · <i>{escape(l['subject'])}</i>" if l["subject"] else ""
+    if strike:
+        return f"<s>{when}  {who}</s>{subject}  <i>отменён</i>"
+    return f"<b>{when}</b>  {who}{subject}"
+
+
+def duration_kb(mode: str, current: int | None = None, sid: int = 0):
+    kb = InlineKeyboardBuilder()
+    for m in DURATIONS:
+        mark = "✅ " if m == current else ""
+        kb.button(text=f"{mark}{fmt_duration(m)}", callback_data=DurCb(mode=mode, minutes=m, sid=sid))
+    mark = "✅ " if current == 0 and mode == "edit" else ""
+    kb.button(text=f"{mark}Не указывать", callback_data=DurCb(mode=mode, minutes=0, sid=sid))
+    if mode == "edit":
+        kb.button(text="◀️ Назад", callback_data=StudentCb(action="open", id=sid))
+    kb.adjust(3, 2, 1, 1)
+    return kb.as_markup()
+
+
+def skip_kb(step: str):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Пропустить ▶️", callback_data=SkipCb(step=step))
+    return kb.as_markup()
+
+
 def parse_price(text: str) -> int | None:
     """'1500', '1 500', '1500 ₽', '1500р' -> 1500; '-' -> 0; иначе None"""
     t = text.strip().lower()
     if t in SKIP:
         return 0
-    # убираем валюту в любом виде («₽», «руб.», «тенге», «$»…) и пробелы-разделители тысяч
+    # из ввода удаляются обозначения валюты («₽», «руб.», «тенге», «$»…) и пробелы-разделители тысяч
     digits = re.sub(r"[^\d\s]", "", t).replace(" ", "").replace("\u00a0", "")
     return int(digits) if digits.isdigit() and int(digits) <= 1_000_000 else None
 
@@ -165,14 +228,13 @@ async def render_day(db: DB, tutor_id: int, d: date):
     if not lessons:
         lines.append("Уроков нет 🎉")
     for l in lessons:
-        name = escape(l["name"])
         if l["status"] == "cancelled":
-            lines.append(f"<s>{l['time']}  {name}</s>  <i>отменён</i>")
+            lines.append(lesson_line(l, strike=True))
         else:
             moved = "  🔁 <i>перенесён</i>" if is_moved(l) else ""
-            lines.append(f"<b>{l['time']}</b>  {name}{moved}")
+            lines.append(lesson_line(l) + moved)
         mark = "❌ " if l["status"] == "cancelled" else "🔁 " if is_moved(l) else ""
-        # слева — сам урок (отмена/перенос), справа — регулярное расписание ученика
+        # слева кнопка самого урока (отмена/перенос), справа — регулярное расписание ученика
         kb.button(text=f"{mark}{l['time']}  {l['name']}", callback_data=LessonCb(action="open", id=l["id"]))
         kb.button(text="🕒", callback_data=StudentCb(action="slots", id=l["student_id"]))
     kb.button(text="◀️", callback_data=DayCb(day=(d - timedelta(days=1)).isoformat()))
@@ -197,9 +259,10 @@ async def render_lesson(db: DB, tutor_id: int, lesson_id: int):
         status = "<i>Регулярный урок</i>"
     else:
         status = "<i>Разовый урок</i>"
-    text = (f"👤 <b>{escape(l['name'])}</b>\n\n"
+    subject = f"📚 {escape(l['subject'])}\n" if l["subject"] else ""
+    text = (f"👤 <b>{escape(l['name'])}</b>\n{subject}\n"
             f"📅 {day_title(d, now().date())}\n"
-            f"⏰ <b>{l['time']}</b>\n\n"
+            f"⏰ <b>{time_range(l['time'], l['duration'])}</b>\n\n"
             f"{status}")
     kb = InlineKeyboardBuilder()
     if l["status"] == "planned":
@@ -214,8 +277,8 @@ async def render_lesson(db: DB, tutor_id: int, lesson_id: int):
     return text, kb.as_markup()
 
 
-def slot_lines(slots) -> list[str]:
-    return [f"<b>{WEEKDAYS[x['weekday']].capitalize()}</b>  {x['time']}" for x in slots]
+def slot_lines(slots, duration: int = 0) -> list[str]:
+    return [f"<b>{WEEKDAYS[x['weekday']].capitalize()}</b>  {time_range(x['time'], duration)}" for x in slots]
 
 
 async def render_student(db: DB, tutor_id: int, student_id: int):
@@ -226,16 +289,19 @@ async def render_student(db: DB, tutor_id: int, student_id: int):
     phone = fmt_phone(s["contact"])
     contact = f"<code>{escape(phone)}</code>" if s["contact"] else "—"
     price = f"{fmt_money(s['price'], s['currency'])} за урок" if s["price"] else "стоимость не указана"
-    lines = [
-        f"👤 <b>{escape(s['name'])}</b>",
+    lines = [f"👤 <b>{escape(s['name'])}</b>"]
+    if s["subject"]:
+        lines.append(f"📚 {escape(s['subject'])}")
+    lines += [
         "",
         f"📞 {contact}",
         f"💵 {price}",
+        f"⏱ {fmt_duration(s['duration']) if s['duration'] else 'длительность не указана'}",
         "",
         f"🗓 <b>Расписание</b>",
     ]
     if slots:
-        lines += slot_lines(slots)
+        lines += slot_lines(slots, s["duration"])
         n = len(slots)
         week = f"{n} {plural(n, 'урок', 'урока', 'уроков')} в неделю"
         if s["price"]:
@@ -245,12 +311,14 @@ async def render_student(db: DB, tutor_id: int, student_id: int):
         lines.append("<i>регулярных уроков нет</i>")
     kb = InlineKeyboardBuilder()
     kb.button(text="🕒 Расписание", callback_data=SlotCb(action="edit", sid=student_id))
+    kb.button(text="📚 Предмет", callback_data=StudentCb(action="subject", id=student_id))
     kb.button(text="💵 Стоимость", callback_data=StudentCb(action="price", id=student_id))
+    kb.button(text="⏱ Длительность", callback_data=StudentCb(action="duration", id=student_id))
     kb.button(text="📞 Телефон", callback_data=StudentCb(action="contact", id=student_id))
     kb.button(text="✏️ Имя", callback_data=StudentCb(action="name", id=student_id))
     kb.button(text="🗑 Удалить", callback_data=StudentCb(action="archive", id=student_id))
     kb.button(text="◀️ Все ученики", callback_data=StudentCb(action="list", id=0))
-    kb.adjust(2, 2, 2)
+    kb.adjust(2, 2, 2, 2)
     return "\n".join(lines), kb.as_markup()
 
 
@@ -261,7 +329,7 @@ async def render_slot_editor(db: DB, tutor_id: int, sid: int):
     slots = await db.slots_of(sid)
     lines = [f"🕒 <b>Расписание: {escape(s['name'])}</b>", ""]
     if slots:
-        lines += slot_lines(slots)
+        lines += slot_lines(slots, s["duration"])
         lines += ["", HINT.format("✖️ — удалить урок, ➕ — добавить новый")]
     else:
         lines += ["Регулярных уроков пока нет.", "", HINT.format("Нажми «➕ Добавить»")]
@@ -270,10 +338,9 @@ async def render_slot_editor(db: DB, tutor_id: int, sid: int):
         kb.button(text=f"✖️ {WEEKDAYS[x['weekday']]} {x['time']}",
                   callback_data=SlotCb(action="del", sid=sid, slot=x["id"]))
     kb.button(text="➕ Добавить", callback_data=SlotCb(action="add", sid=sid))
-    kb.button(text="⌨️ Текстом", callback_data=StudentCb(action="slots_text", id=sid))
     kb.button(text="✅ Готово", callback_data=StudentCb(action="open", id=sid))
     n = len(slots)
-    kb.adjust(*([2] * (n // 2)), *([1] if n % 2 else []), 1, 2)  # уроки парами, «Добавить», «Текстом | Готово»
+    kb.adjust(*([2] * (n // 2)), *([1] if n % 2 else []), 2)  # уроки парами, затем «Добавить | Готово»
     return "\n".join(lines), kb.as_markup()
 
 
@@ -324,7 +391,8 @@ async def render_students(db: DB, tutor_id: int):
         info = f"{n} {plural(n, 'урок', 'урока', 'уроков')}/нед" if n else "без расписания"
         if s["price"]:
             info += f" · {fmt_money(s['price'], s['currency'])}"
-        lines.append(f"<b>{escape(s['name'])}</b> — {info}")
+        subject = f" · <i>{escape(s['subject'])}</i>" if s["subject"] else ""
+        lines.append(f"<b>{escape(s['name'])}</b>{subject} — {info}")
         kb.button(text=s["name"], callback_data=StudentCb(action="open", id=s["id"]))
     kb.adjust(2)
 
@@ -358,7 +426,7 @@ async def render_digest(db: DB, tutor_id: int, d: date) -> str:
         return head + "\n\nСегодня уроков нет 🎉"
     n = len(lessons)
     lines = [head, f"Сегодня {n} {plural(n, 'урок', 'урока', 'уроков')}:", ""]
-    lines += [f"<b>{l['time']}</b>  {escape(l['name'])}" for l in lessons]
+    lines += [lesson_line(l) for l in lessons]
     return "\n".join(lines)
 
 
@@ -419,7 +487,7 @@ async def menu_week(msg: Message, db: DB, state: FSMContext):
         d = start + timedelta(days=i)
         lessons = [l for l in await db.lessons_on(msg.from_user.id, d) if l["status"] == "planned"]
         lines.append(f"<b>{day_title(d, start)}</b>")
-        lines += [f"     {l['time']}  {escape(l['name'])}" for l in lessons] or ["     <i>нет уроков</i>"]
+        lines += [f"     {lesson_line(l)}" for l in lessons] or ["     <i>нет уроков</i>"]
         lines.append("")
         for l in lessons:
             students.setdefault(l["student_id"], l["name"])
@@ -460,40 +528,97 @@ async def add_start(msg: Message, db: DB, state: FSMContext):
 @router.message(AddStudent.name, F.text)
 async def add_name(msg: Message, state: FSMContext):
     await state.update_data(name=msg.text.strip()[:64])
+    await state.set_state(AddStudent.subject)
+    await msg.answer("📚 Какой предмет? Например, <i>английский</i> или <i>казахская литература</i>.\n"
+                     "Можно пропустить — предмет добавляется и позже, в карточке ученика.",
+                     reply_markup=skip_kb("subject"))
+
+
+async def to_contact(target: Message, state: FSMContext):
     await state.set_state(AddStudent.contact)
-    await msg.answer("Контакт: телефон (для кнопки WhatsApp) или @ник. Если не нужно — «-»")
+    await target.answer("📞 Контакт: телефон (для кнопки WhatsApp) или @ник.", reply_markup=skip_kb("contact"))
+
+
+async def to_price(target: Message, state: FSMContext):
+    await state.set_state(AddStudent.price)
+    await target.answer("💵 Стоимость одного урока — просто число, например <code>1500</code>. "
+                        "Валюта выбирается на следующем шаге.", reply_markup=skip_kb("price"))
+
+
+async def to_duration(target: Message, state: FSMContext, edit_cb: CallbackQuery | None = None):
+    """Шаг «длительность урока»: новым сообщением или правкой сообщения с кнопками валют."""
+    await state.set_state(AddStudent.duration)
+    text = "⏱ Сколько длится один урок?"
+    if edit_cb:
+        await safe_edit(edit_cb, text, reply_markup=duration_kb("new"))
+    else:
+        await target.answer(text, reply_markup=duration_kb("new"))
+
+
+async def after_price(target: Message, state: FSMContext, price: int):
+    """После цены: если цена указана — выбор валюты, иначе сразу длительность."""
+    await state.update_data(price=price)
+    if price:
+        await state.set_state(AddStudent.currency)
+        await target.answer(f"Стоимость: <b>{price:,}</b>. В какой валюте?".replace(",", "\u00a0"),
+                            reply_markup=currency_kb("new"))
+    else:
+        await to_duration(target, state)
+
+
+@router.message(AddStudent.subject, F.text)
+async def add_subject(msg: Message, state: FSMContext):
+    text = msg.text.strip()
+    await state.update_data(subject=None if text in SKIP else text[:64])
+    await to_contact(msg, state)
 
 
 @router.message(AddStudent.contact, F.text)
 async def add_contact(msg: Message, state: FSMContext):
-    contact = None if msg.text.strip() in SKIP else msg.text.strip()[:64]
-    await state.update_data(contact=contact)
-    await state.set_state(AddStudent.price)
-    await msg.answer("Стоимость одного урока — просто число, например <code>1500</code>. "
-                     "Валюту выберешь на следующем шаге.\nЕсли не нужно — «-».")
+    text = msg.text.strip()
+    await state.update_data(contact=None if text in SKIP else text[:64])
+    await to_price(msg, state)
 
 
 @router.message(AddStudent.price, F.text)
-async def add_price(msg: Message, db: DB, state: FSMContext):
+async def add_price(msg: Message, state: FSMContext):
     price = parse_price(msg.text)
     if price is None:
-        await msg.answer("Нужно число, например <code>1500</code>, или «-».")
+        await msg.answer("Нужно число, например <code>1500</code>, или кнопка «Пропустить».",
+                         reply_markup=skip_kb("price"))
         return
-    if price:
-        await state.update_data(price=price)
-        await state.set_state(AddStudent.currency)
-        await msg.answer(f"Стоимость: <b>{price:,}</b>. В какой валюте?".replace(",", "\u00a0"), reply_markup=currency_kb("new"))
-        return
-    data = await state.get_data()
-    await state.clear()
-    sid = await db.add_student(msg.from_user.id, data["name"], data["contact"], 0)
-    text, kb = await render_slot_editor(db, msg.from_user.id, sid)
-    await msg.answer(ADDED + text, reply_markup=kb)
+    await after_price(msg, state, price)
 
 
 @router.message(AddStudent.currency)
 async def add_currency_text(msg: Message):
     await msg.answer("Выбери валюту кнопкой в сообщении выше 👆 (или /cancel — отмена).")
+
+
+@router.message(AddStudent.duration)
+async def add_duration_text(msg: Message):
+    await msg.answer("Выбери длительность кнопкой в сообщении выше 👆 (или /cancel — отмена).")
+
+
+@router.callback_query(SkipCb.filter())
+async def cb_skip(cb: CallbackQuery, callback_data: SkipCb, state: FSMContext):
+    step = callback_data.step
+    if await state.get_state() != getattr(AddStudent, step).state:
+        await cb.answer("Эта кнопка устарела", show_alert=False)
+        return
+    try:
+        await cb.message.edit_reply_markup(reply_markup=None)  # кнопка «Пропустить» больше не нужна
+    except TelegramBadRequest:
+        pass
+    if step == "subject":
+        await state.update_data(subject=None)
+        await to_contact(cb.message, state)
+    elif step == "contact":
+        await state.update_data(contact=None)
+        await to_price(cb.message, state)
+    elif step == "price":
+        await after_price(cb.message, state, 0)
+    await cb.answer("Пропущено")
 
 
 ADDED = "✅ Ученик добавлен. Теперь добавь регулярные уроки (если их нет — просто нажми «Готово»).\n\n"
@@ -511,14 +636,13 @@ async def cb_currency(cb: CallbackQuery, callback_data: CurCb, db: DB, state: FS
             await cb.answer("Эта кнопка устарела — начни добавление заново", show_alert=True)
             return
         data = await state.get_data()
-        await state.clear()
-        sid = await db.add_student(cb.from_user.id, data["name"], data["contact"], data["price"], cd.code)
-        text, kb = await render_slot_editor(db, cb.from_user.id, sid)
-        await safe_edit(cb, ADDED + text, reply_markup=kb)
+        await state.update_data(currency=cd.code)
+        await to_duration(cb.message, state, edit_cb=cb)
         await cb.answer(f"Стоимость: {fmt_money(data['price'], cd.code)}")
         return
 
-    # mode == "edit": новая цена уже в кнопке
+    # mode == "edit": новая цена передаётся в самой кнопке
+    await state.clear()
     s = await db.student(cd.sid, cb.from_user.id)
     if not s or not s["active"]:
         await cb.answer("Ученик не найден", show_alert=True)
@@ -529,10 +653,41 @@ async def cb_currency(cb: CallbackQuery, callback_data: CurCb, db: DB, state: FS
     await cb.answer()
 
 
+@router.callback_query(DurCb.filter())
+async def cb_duration(cb: CallbackQuery, callback_data: DurCb, db: DB, state: FSMContext):
+    cd = callback_data
+    minutes = cd.minutes if cd.minutes in DURATIONS else 0
+
+    if cd.mode == "new":
+        if await state.get_state() != AddStudent.duration.state:
+            await cb.answer("Эта кнопка устарела — начни добавление заново", show_alert=True)
+            return
+        data = await state.get_data()
+        await state.clear()
+        sid = await db.add_student(cb.from_user.id, data["name"], data.get("contact"), data.get("price", 0),
+                                   data.get("currency", "RUB"), data.get("subject"), minutes)
+        text, kb = await render_slot_editor(db, cb.from_user.id, sid)
+        await safe_edit(cb, ADDED + text, reply_markup=kb)
+        await cb.answer()
+        return
+
+    # mode == "edit"
+    await state.clear()
+    s = await db.student(cd.sid, cb.from_user.id)
+    if not s or not s["active"]:
+        await cb.answer("Ученик не найден", show_alert=True)
+        return
+    await db.set_duration(s["id"], minutes)
+    text, kb = await render_student(db, cb.from_user.id, s["id"])
+    await safe_edit(cb, "✅ Длительность обновлена\n\n" + text, reply_markup=kb)
+    await cb.answer()
+
+
 # ================= навигация по дням и урокам =================
 
 @router.callback_query(DayCb.filter())
-async def cb_day(cb: CallbackQuery, callback_data: DayCb, db: DB):
+async def cb_day(cb: CallbackQuery, callback_data: DayCb, db: DB, state: FSMContext):
+    await state.clear()  # нажатие кнопки отменяет незаконченный ввод текста
     text, kb = await render_day(db, cb.from_user.id, date.fromisoformat(callback_data.day))
     await safe_edit(cb, text, reply_markup=kb)
     await cb.answer()
@@ -540,6 +695,7 @@ async def cb_day(cb: CallbackQuery, callback_data: DayCb, db: DB):
 
 @router.callback_query(LessonCb.filter())
 async def cb_lesson(cb: CallbackQuery, callback_data: LessonCb, db: DB, state: FSMContext):
+    await state.clear()
     lesson = await db.lesson(callback_data.id, cb.from_user.id)
     if not lesson:
         await cb.answer("Урок не найден", show_alert=True)
@@ -573,6 +729,7 @@ async def cb_lesson(cb: CallbackQuery, callback_data: LessonCb, db: DB, state: F
 
 @router.callback_query(StudentCb.filter())
 async def cb_student(cb: CallbackQuery, callback_data: StudentCb, db: DB, state: FSMContext):
+    await state.clear()  # ветки ниже при необходимости задают новый шаг ввода
     action, sid = callback_data.action, callback_data.id
 
     if action == "list":
@@ -590,17 +747,6 @@ async def cb_student(cb: CallbackQuery, callback_data: StudentCb, db: DB, state:
     if action == "slots":
         text, kb = await render_slot_editor(db, cb.from_user.id, sid)
         await cb.message.answer(text, reply_markup=kb)
-    elif action == "slots_text":
-        await state.set_state(Ask.slots)
-        await state.update_data(target=sid)
-        slots = await db.slots_of(sid)
-        current = ", ".join(f"{WEEKDAYS[x['weekday']]} {x['time']}" for x in slots)
-        current_line = (f"Сейчас: <code>{current}</code>\n(нажми, чтобы скопировать, и поправь)\n\n"
-                        if current else "Регулярных уроков сейчас нет.\n\n")
-        await cb.message.answer(f"Расписание: <b>{name}</b>\n{current_line}"
-                                "Отправь новое целиком, например <code>вт 17:00, сб 12:00</code>. "
-                                "«-» — без регулярных уроков.\n"
-                                "Прошедшие уроки не изменятся. /cancel — отмена.")
     elif action == "price":
         await state.set_state(Ask.price)
         await state.update_data(target=sid)
@@ -608,6 +754,17 @@ async def cb_student(cb: CallbackQuery, callback_data: StudentCb, db: DB, state:
                                 f"{fmt_price(s['price'], s['currency'])}.\n\n"
                                 "Напиши новую — просто число, например <code>1500</code>, "
                                 "валюту выберешь следующим шагом.\n«-» — убрать стоимость. /cancel — отмена.")
+    elif action == "subject":
+        await state.set_state(Ask.subject)
+        await state.update_data(target=sid)
+        current = f"<b>{escape(s['subject'])}</b>" if s["subject"] else "не указан"
+        await cb.message.answer(f"📚 Предмет у <b>{name}</b> сейчас: {current}\n\n"
+                                "Напиши предмет, например <i>английский</i> или <i>казахская литература</i>.\n"
+                                "«-» — убрать предмет. /cancel — отмена.")
+    elif action == "duration":
+        current = fmt_duration(s["duration"]) if s["duration"] else "не указана"
+        await safe_edit(cb, f"⏱ Длительность урока у <b>{name}</b> сейчас: {current}\n\nВыбери новую:",
+                        reply_markup=duration_kb("edit", s["duration"], sid))
     elif action == "contact":
         await state.set_state(Ask.contact)
         await state.update_data(target=sid)
@@ -641,7 +798,8 @@ async def cb_student(cb: CallbackQuery, callback_data: StudentCb, db: DB, state:
 # ================= редактор расписания на кнопках =================
 
 @router.callback_query(SlotCb.filter())
-async def cb_slots(cb: CallbackQuery, callback_data: SlotCb, db: DB):
+async def cb_slots(cb: CallbackQuery, callback_data: SlotCb, db: DB, state: FSMContext):
+    await state.clear()
     cd = callback_data
     s = await db.student(cd.sid, cb.from_user.id)
     if not s or not s["active"]:
@@ -727,7 +885,8 @@ def render_digest_time_picker(cd: SetCb, current: str):
 
 
 @router.callback_query(SetCb.filter())
-async def cb_settings(cb: CallbackQuery, callback_data: SetCb, db: DB):
+async def cb_settings(cb: CallbackQuery, callback_data: SetCb, db: DB, state: FSMContext):
+    await state.clear()
     cd = callback_data
     await db.ensure_tutor(cb.from_user.id, now().date())
     note = None
@@ -815,7 +974,8 @@ def render_move_picker(lesson, cd: MoveCb):
 
 
 @router.callback_query(MoveCb.filter())
-async def cb_move(cb: CallbackQuery, callback_data: MoveCb, db: DB):
+async def cb_move(cb: CallbackQuery, callback_data: MoveCb, db: DB, state: FSMContext):
+    await state.clear()
     cd = callback_data
     lesson = await db.lesson(cd.id, cb.from_user.id)
     if not lesson:
@@ -828,7 +988,7 @@ async def cb_move(cb: CallbackQuery, callback_data: MoveCb, db: DB):
         await cb.answer()
         return
 
-    # action == "m": переносим
+    # action == "m": перенос урока на выбранные день и время
     d = date.fromisoformat(cd.day)
     t = f"{cd.h:02d}:{cd.m:02d}"
     if f"{cd.day} {t}" < now_key():
@@ -852,20 +1012,6 @@ async def _target_student(msg: Message, db: DB, state: FSMContext):
     return await db.student(data.get("target", 0), msg.from_user.id)
 
 
-@router.message(Ask.slots, F.text)
-async def ask_slots(msg: Message, db: DB, state: FSMContext):
-    s = await _target_student(msg, db, state)
-    text = msg.text.strip()
-    slots = [] if text in SKIP else parse_slots(text)
-    if not s or slots is None:
-        await msg.answer("Не понял. Формат: <code>вт 17:00, чт 18:30</code>. /cancel — отмена.")
-        return
-    await state.clear()
-    await db.replace_slots(s["id"], slots, now())
-    text, kb = await render_student(db, msg.from_user.id, s["id"])
-    await msg.answer("✅ Расписание обновлено\n\n" + text, reply_markup=kb)
-
-
 @router.message(Ask.price, F.text)
 async def ask_price(msg: Message, db: DB, state: FSMContext):
     s = await _target_student(msg, db, state)
@@ -881,6 +1027,21 @@ async def ask_price(msg: Message, db: DB, state: FSMContext):
     await db.set_price(s["id"], 0)
     text, kb = await render_student(db, msg.from_user.id, s["id"])
     await msg.answer("✅ Стоимость убрана\n\n" + text, reply_markup=kb)
+
+
+@router.message(Ask.subject, F.text)
+async def ask_subject(msg: Message, db: DB, state: FSMContext):
+    s = await _target_student(msg, db, state)
+    if not s:
+        await state.clear()
+        await msg.answer("Ученик не найден.")
+        return
+    text = msg.text.strip()
+    subject = None if text in SKIP else text[:64]
+    await state.clear()
+    await db.set_subject(s["id"], subject)
+    card, kb = await render_student(db, msg.from_user.id, s["id"])
+    await msg.answer(("✅ Предмет сохранён" if subject else "✅ Предмет убран") + "\n\n" + card, reply_markup=kb)
 
 
 @router.message(Ask.contact, F.text)
@@ -918,5 +1079,5 @@ async def ask_name(msg: Message, db: DB, state: FSMContext):
 
 @router.message()
 async def fallback(msg: Message):
-    """Неизвестный текст (например, кнопка из старой версии меню) — присылаем актуальное меню."""
+    """Ответ на неизвестный текст (например, кнопку из старой версии меню): отправка актуального меню."""
     await msg.answer("Не понял 🤔 Выбери действие в меню ниже.", reply_markup=main_kb())
