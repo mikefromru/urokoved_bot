@@ -1,0 +1,31 @@
+# Секреты: токен бота и ADMIN_ID
+.env
+.env.*
+
+# База и её бэкапы — там имена и телефоны учеников
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.db.bak
+backups/
+
+# Логи — в них тоже есть данные пользователей
+logs/
+*.log
+
+# Виртуальные окружения (у тебя, например, venv14)
+venv*/
+.venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Редакторы и система
+.vscode/
+.idea/
+*.swp
+.DS_Store
