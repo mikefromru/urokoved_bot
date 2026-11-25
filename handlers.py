@@ -561,6 +561,13 @@ async def cmd_digest(msg: Message, command: CommandObject, db: DB):
     await msg.answer(f"Готово, сводка будет приходить в {t}.")
 
 
+@router.message(Command("today"))
+async def cmd_today(msg: Message, db: DB, state: FSMContext):
+    await state.clear()
+    text, kb = await render_day(db, msg.from_user.id, now().date())
+    await msg.answer(text, reply_markup=kb)
+
+
 @router.message(F.text.in_({BTN_TODAY, BTN_TOMORROW}))
 async def menu_day(msg: Message, db: DB, state: FSMContext):
     await state.clear()
@@ -569,6 +576,8 @@ async def menu_day(msg: Message, db: DB, state: FSMContext):
     await msg.answer(text, reply_markup=kb)
 
 
+# Декораторы стоят друг над другом: одна функция отвечает и на кнопку, и на команду из меню
+@router.message(Command("week"))
 @router.message(F.text == BTN_WEEK)
 async def menu_week(msg: Message, db: DB, state: FSMContext):
     await state.clear()
@@ -592,6 +601,7 @@ async def menu_week(msg: Message, db: DB, state: FSMContext):
     await msg.answer("\n".join(lines).rstrip(), reply_markup=kb.as_markup())
 
 
+@router.message(Command("students"))
 @router.message(F.text == BTN_STUDENTS)
 async def menu_students(msg: Message, db: DB, state: FSMContext):
     await state.clear()
@@ -599,6 +609,7 @@ async def menu_students(msg: Message, db: DB, state: FSMContext):
     await msg.answer(text, reply_markup=kb)
 
 
+@router.message(Command("schedule"))
 @router.message(F.text == BTN_SCHEDULE)
 async def menu_schedule(msg: Message, db: DB, state: FSMContext):
     await state.clear()
@@ -612,6 +623,13 @@ async def cmd_help(msg: Message, state: FSMContext):
     await msg.answer(HELP_TEXT, reply_markup=help_kb())
 
 
+@router.message(Command("about"))
+async def cmd_about(msg: Message, state: FSMContext):
+    await state.clear()
+    await msg.answer(ABOUT_TEXT, reply_markup=help_kb())
+
+
+@router.message(Command("settings"))
 @router.message(F.text == BTN_SETTINGS)
 async def menu_settings(msg: Message, db: DB, state: FSMContext):
     await state.clear()
@@ -622,6 +640,7 @@ async def menu_settings(msg: Message, db: DB, state: FSMContext):
 
 # ================= добавление ученика =================
 
+@router.message(Command("add"))
 @router.message(F.text == BTN_ADD)
 async def add_start(msg: Message, db: DB, state: FSMContext):
     await state.clear()
@@ -1209,6 +1228,37 @@ async def ask_name(msg: Message, db: DB, state: FSMContext):
 
 
 # ================= всё остальное =================
+
+# Команды для кнопки «Меню» слева от поля ввода (устанавливаются при запуске бота в bot.py)
+BOT_COMMANDS = [
+    ("start", "Главное меню"),
+    ("schedule", "Расписание на неделю"),
+    ("today", "Уроки на сегодня"),
+    ("week", "Уроки на неделю"),
+    ("students", "Ученики"),
+    ("add", "Новый ученик"),
+    ("settings", "Утренняя сводка и часовой пояс"),
+    ("help", "Как пользоваться ботом"),
+    ("about", "О боте"),
+]
+# Дополнительные команды, которые видит только владелец бота
+ADMIN_COMMANDS = [
+    ("stats", "Статистика"),
+    ("backup", "Бэкап базы"),
+    ("reply", "Ответить пользователю: /reply id текст"),
+]
+
+ABOUT_TEXT = (
+    "📅 <b>Уроковед</b> — расписание уроков для репетиторов прямо в Telegram.\n\n"
+    "• регулярные уроки по дням недели, с предметом и длительностью\n"
+    "• перенос и отмена урока в пару нажатий\n"
+    "• утренняя сводка по вашему часовому поясу\n"
+    "• напоминания ученикам, в том числе через WhatsApp\n"
+    "• стоимость урока в валютах СНГ\n\n"
+    "Ваших учеников и расписание видите только вы. Удалить ученика можно в его карточке.\n\n"
+    "Бот бесплатный и сейчас в бета-тесте. Вопрос или пожелание можно написать прямо сюда — "
+    "сообщение получит разработчик."
+)
 
 HELP_TEXT = (
     "❓ <b>Как пользоваться ботом</b>\n\n"

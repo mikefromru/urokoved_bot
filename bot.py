@@ -8,13 +8,13 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
-from aiogram.types import FSInputFile
+from aiogram.types import BotCommand, BotCommandScopeChat, BotCommandScopeDefault, FSInputFile
 
 from admin import router as admin_router
 from backup import has_backup_for, make_backup
 from config import ADMIN_ID, BACKUP_TIME, BOT_TOKEN, DB_PATH, TZ
 from db import DB
-from handlers import render_digest, router
+from handlers import ADMIN_COMMANDS, BOT_COMMANDS, render_digest, router
 from middlewares import ActionLogMiddleware, MenuUpdateMiddleware, TutorTimezoneMiddleware
 
 LOG_FILE = Path(__file__).with_name("logs") / "bot.log"
@@ -33,6 +33,18 @@ def setup_logging():
         root.addHandler(h)
     # aiogram пишет строку на каждый апдейт; действия уже пишет ActionLogMiddleware, поэтому от aiogram — только ошибки
     logging.getLogger("aiogram.event").setLevel(logging.WARNING)
+
+
+async def setup_commands(bot: Bot):
+    """Заполняет кнопку «Меню» в Telegram: общий список команд и расширенный — для владельца."""
+    common = [BotCommand(command=c, description=d) for c, d in BOT_COMMANDS]
+    try:
+        await bot.set_my_commands(common, scope=BotCommandScopeDefault())
+        if ADMIN_ID:
+            admin = common + [BotCommand(command=c, description=d) for c, d in ADMIN_COMMANDS]
+            await bot.set_my_commands(admin, scope=BotCommandScopeChat(chat_id=ADMIN_ID))
+    except Exception:
+        logging.exception("Не удалось установить команды меню")
 
 
 async def send_backup(bot: Bot, path, caption: str):
@@ -119,6 +131,7 @@ async def main():
     if not ADMIN_ID:
         logging.warning("ADMIN_ID не задан в .env — бэкапы не будут присылаться в Telegram")
 
+    await setup_commands(bot)
     task = asyncio.create_task(scheduler(bot, db))
     try:
         # db=db попадает в аргументы всех хендлеров
