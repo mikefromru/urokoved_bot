@@ -15,7 +15,7 @@ from backup import has_backup_for, make_backup
 from config import ADMIN_ID, BACKUP_TIME, BOT_TOKEN, DB_PATH, TZ
 from db import DB
 from handlers import render_digest, router
-from middlewares import ActionLogMiddleware, TutorTimezoneMiddleware
+from middlewares import ActionLogMiddleware, MenuUpdateMiddleware, TutorTimezoneMiddleware
 
 LOG_FILE = Path(__file__).with_name("logs") / "bot.log"
 
@@ -31,7 +31,7 @@ def setup_logging():
     for h in (console, file):
         h.setFormatter(fmt)
         root.addHandler(h)
-    # aiogram пишет строку на каждый апдейт — у нас есть свой лог действий, поэтому только ошибки
+    # aiogram пишет строку на каждый апдейт; действия уже пишет ActionLogMiddleware, поэтому от aiogram — только ошибки
     logging.getLogger("aiogram.event").setLevel(logging.WARNING)
 
 
@@ -114,6 +114,7 @@ async def main():
     for observer in (dp.message, dp.callback_query):
         observer.outer_middleware(ActionLogMiddleware())
         observer.outer_middleware(TutorTimezoneMiddleware())
+        observer.outer_middleware(MenuUpdateMiddleware())
     logging.info("Бот запущен, база: %s, логи: %s", DB_PATH, LOG_FILE)
     if not ADMIN_ID:
         logging.warning("ADMIN_ID не задан в .env — бэкапы не будут присылаться в Telegram")

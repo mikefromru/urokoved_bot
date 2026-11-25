@@ -12,7 +12,8 @@ CREATE TABLE IF NOT EXISTS tutors (
     last_digest  TEXT,                     -- дата последней утренней сводки
     digest_on    INTEGER NOT NULL DEFAULT 1,
     tz           TEXT NOT NULL DEFAULT 'Europe/Moscow',  -- часовой пояс репетитора
-    blocked      INTEGER NOT NULL DEFAULT 0              -- 1 = заблокировал бота, сводки не шлём
+    blocked      INTEGER NOT NULL DEFAULT 0,             -- 1 = заблокировал бота, сводки не отправляются
+    kb_version   INTEGER NOT NULL DEFAULT 0              -- версия главного меню, которую видел репетитор
 );
 
 CREATE TABLE IF NOT EXISTS students (
@@ -90,6 +91,8 @@ class DB:
             await self.conn.execute("ALTER TABLE tutors ADD COLUMN tz TEXT NOT NULL DEFAULT 'Europe/Moscow'")
         if "blocked" not in cols:
             await self.conn.execute("ALTER TABLE tutors ADD COLUMN blocked INTEGER NOT NULL DEFAULT 0")
+        if "kb_version" not in cols:
+            await self.conn.execute("ALTER TABLE tutors ADD COLUMN kb_version INTEGER NOT NULL DEFAULT 0")
         cols = {r["name"] for r in await self._all("PRAGMA table_info(students)")}
         if "currency" not in cols:
             await self.conn.execute("ALTER TABLE students ADD COLUMN currency TEXT NOT NULL DEFAULT 'RUB'")
@@ -136,6 +139,10 @@ class DB:
             await self.conn.execute("UPDATE tutors SET last_digest = ? WHERE user_id = ? "
                                     "AND (last_digest IS NULL OR last_digest < ?)",
                                     (at.date().isoformat(), user_id, at.date().isoformat()))
+        await self.conn.commit()
+
+    async def set_kb_version(self, user_id: int, version: int):
+        await self.conn.execute("UPDATE tutors SET kb_version = ? WHERE user_id = ?", (version, user_id))
         await self.conn.commit()
 
     async def set_blocked(self, user_id: int, blocked: bool):
@@ -252,6 +259,15 @@ class DB:
     async def slots_of(self, student_id: int):
         return await self._all(
             "SELECT * FROM slots WHERE student_id = ? ORDER BY weekday, time", (student_id,)
+        )
+
+    async def week_template(self, tutor_id: int):
+        """Все регулярные уроки репетитора по дням недели, с именем, предметом и длительностью ученика."""
+        return await self._all(
+            "SELECT sl.weekday, sl.time, s.id AS student_id, s.name, s.subject, s.duration "
+            "FROM slots sl JOIN students s ON s.id = sl.student_id "
+            "WHERE s.tutor_id = ? AND s.active = 1 ORDER BY sl.weekday, sl.time, s.name",
+            (tutor_id,),
         )
 
     async def replace_slots(self, student_id: int, slots: list[tuple[int, str]], at: datetime):

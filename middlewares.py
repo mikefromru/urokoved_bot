@@ -76,3 +76,28 @@ class TutorTimezoneMiddleware(BaseMiddleware):
             return await handler(event, data)
         finally:
             CURRENT_TZ.reset(token)
+
+
+class MenuUpdateMiddleware(BaseMiddleware):
+    """После обработки события один раз отправляет обновлённое главное меню тем,
+    у кого в Telegram осталась клавиатура старой версии (Telegram хранит её до замены ботом)."""
+    async def __call__(self, handler, event, data):
+        result = await handler(event, data)
+        user = getattr(event, "from_user", None)
+        db = data.get("db")
+        if user is None or db is None:
+            return result
+        from handlers import BTN_SCHEDULE, MENU_VERSION, main_kb  # импорт здесь: handlers загружается позже
+        tutor = await db.tutor(user.id)
+        if tutor and tutor["kb_version"] < MENU_VERSION:
+            await db.set_kb_version(user.id, MENU_VERSION)
+            try:
+                await data["bot"].send_message(
+                    user.id,
+                    f"🆕 В меню появилась кнопка «{BTN_SCHEDULE}»: там все уроки на неделю "
+                    "и «➕ Добавить урок».",
+                    reply_markup=main_kb(),
+                )
+            except Exception:
+                log.exception("Не удалось отправить обновлённое меню %s", who(user))
+        return result

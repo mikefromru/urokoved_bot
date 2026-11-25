@@ -1,5 +1,6 @@
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
+import logging
 import re
 from html import escape
 from urllib.parse import quote
@@ -13,6 +14,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 
+from config import ADMIN_ID
 from db import DB
 from utils import (CURRENT_TZ, CURRENCIES, TIMEZONES, WEEKDAYS, tz_label, WEEKDAYS_FULL, day_title, now_key, fmt_day, fmt_money, fmt_phone, plural, now,
                    parse_time, whatsapp_phone)
@@ -23,14 +25,17 @@ router = Router()
 
 BTN_TODAY, BTN_TOMORROW, BTN_WEEK = "📅 Сегодня", "📆 Завтра", "🗓 Неделя"
 BTN_STUDENTS, BTN_ADD, BTN_SETTINGS = "👥 Ученики", "➕ Новый ученик", "⚙️ Настройки"
-MENU_BUTTONS = {BTN_TODAY, BTN_TOMORROW, BTN_WEEK, BTN_STUDENTS, BTN_ADD, BTN_SETTINGS}
+BTN_SCHEDULE = "🕒 Расписание"
+# Версия главного меню: при её увеличении пользователи один раз получают обновлённую клавиатуру
+MENU_VERSION = 1
+MENU_BUTTONS = {BTN_TODAY, BTN_TOMORROW, BTN_WEEK, BTN_SCHEDULE, BTN_STUDENTS, BTN_ADD, BTN_SETTINGS}
 
 
 def main_kb():
     kb = ReplyKeyboardBuilder()
-    for text in (BTN_TODAY, BTN_TOMORROW, BTN_WEEK, BTN_STUDENTS, BTN_ADD, BTN_SETTINGS):
+    for text in (BTN_TODAY, BTN_TOMORROW, BTN_WEEK, BTN_SCHEDULE, BTN_STUDENTS, BTN_ADD, BTN_SETTINGS):
         kb.button(text=text)
-    kb.adjust(3, 3)
+    kb.adjust(3, 2, 2)  # дни | расписание и ученики | новый ученик и настройки
     return kb.as_markup(resize_keyboard=True)
 
 
@@ -56,6 +61,18 @@ class SlotCb(CallbackData, prefix="sl"):
     wd: int = -1       # день недели
     h: int = -1        # час
     m: int = -1        # минуты
+    ret: str = ""      # куда вернуться после добавления: "" — редактор, "sched" — расписание, дата — день
+
+
+class PickCb(CallbackData, prefix="pk"):
+    """Выбор ученика для нового регулярного урока."""
+    ret: str           # "sched" или дата YYYY-MM-DD экрана дня
+    wd: int = -1       # день недели, если он уже известен (добавление из экрана дня)
+
+
+class SchedCb(CallbackData, prefix="sch"):
+    """Открыть экран «Расписание на неделю»."""
+    v: int = 0
 
 
 class MoveCb(CallbackData, prefix="mv"):
@@ -238,8 +255,9 @@ async def render_day(db: DB, tutor_id: int, d: date):
         kb.button(text=f"{mark}{l['time']}  {l['name']}", callback_data=LessonCb(action="open", id=l["id"]))
         kb.button(text="🕒", callback_data=StudentCb(action="slots", id=l["student_id"]))
     kb.button(text="◀️", callback_data=DayCb(day=(d - timedelta(days=1)).isoformat()))
+    kb.button(text="➕ Урок", callback_data=PickCb(ret=d.isoformat(), wd=d.weekday()))
     kb.button(text="▶️", callback_data=DayCb(day=(d + timedelta(days=1)).isoformat()))
-    kb.adjust(*([2] * len(lessons)), 2)
+    kb.adjust(*([2] * len(lessons)), 3)
     if lessons:
         lines += ["", HINT.format("Урок — отменить или перенести\n🕒 — расписание ученика")]
     return "\n".join(lines), kb.as_markup()
@@ -344,29 +362,100 @@ async def render_slot_editor(db: DB, tutor_id: int, sid: int):
     return "\n".join(lines), kb.as_markup()
 
 
+EVERY_WEEKDAY = ["Каждый понедельник", "Каждый вторник", "Каждую среду", "Каждый четверг",
+                 "Каждую пятницу", "Каждую субботу", "Каждое воскресенье"]
+WEEKDAYS_PLURAL_DAT = ["понедельникам", "вторникам", "средам", "четвергам",
+                       "пятницам", "субботам", "воскресеньям"]
+
+
+def return_cb(cd):
+    """Кнопка «Назад» к экрану, с которого началось добавление урока."""
+    if cd.ret == "sched":
+        return SchedCb()
+    if cd.ret:
+        return DayCb(day=cd.ret)
+    return SlotCb(action="edit", sid=cd.sid)
+
+
 def render_picker(name: str, cd: SlotCb):
-    """Шаги добавления: день недели -> час -> минуты."""
+    """Шаги добавления регулярного урока: день недели -> час -> минуты."""
     kb = InlineKeyboardBuilder()
     head = f"🕒 <b>{escape(name)}</b> · новый урок\n\n"
     if cd.action == "add":
         text = head + "Шаг 1 из 3: <b>день недели</b>"
         for i, wd in enumerate(WEEKDAYS):
-            kb.button(text=wd.capitalize(), callback_data=SlotCb(action="wd", sid=cd.sid, wd=i))
-        kb.button(text="◀️ Назад", callback_data=SlotCb(action="edit", sid=cd.sid))
+            kb.button(text=wd.capitalize(), callback_data=SlotCb(action="wd", sid=cd.sid, wd=i, ret=cd.ret))
+        kb.button(text="◀️ Назад", callback_data=return_cb(cd))
         kb.adjust(4, 3, 1)
     elif cd.action == "wd":
-        text = head + f"{WEEKDAYS_FULL[cd.wd].capitalize()}\n\nШаг 2 из 3: <b>час</b>"
+        text = head + f"{EVERY_WEEKDAY[cd.wd]}\n\nШаг 2 из 3: <b>час</b>"
         for h in HOURS:
-            kb.button(text=f"{h:02d}:__", callback_data=SlotCb(action="h", sid=cd.sid, wd=cd.wd, h=h))
-        kb.button(text="◀️ Назад", callback_data=SlotCb(action="add", sid=cd.sid))
+            kb.button(text=f"{h:02d}:__", callback_data=SlotCb(action="h", sid=cd.sid, wd=cd.wd, h=h, ret=cd.ret))
+        # из экрана дня день недели уже выбран, поэтому «Назад» ведёт к выбору ученика
+        if cd.ret and cd.ret != "sched":
+            back = PickCb(ret=cd.ret, wd=cd.wd)
+        else:
+            back = SlotCb(action="add", sid=cd.sid, ret=cd.ret)
+        kb.button(text="◀️ Назад", callback_data=back)
         kb.adjust(*([4] * ((len(HOURS) + 3) // 4)), 1)
     else:  # "h"
         text = head + f"{WEEKDAYS_FULL[cd.wd].capitalize()}, {cd.h:02d}:__\n\nШаг 3 из 3: <b>минуты</b>"
         for m in MINUTES:
             kb.button(text=f"{cd.h:02d}:{m:02d}",
-                      callback_data=SlotCb(action="m", sid=cd.sid, wd=cd.wd, h=cd.h, m=m))
-        kb.button(text="◀️ Назад", callback_data=SlotCb(action="wd", sid=cd.sid, wd=cd.wd))
+                      callback_data=SlotCb(action="m", sid=cd.sid, wd=cd.wd, h=cd.h, m=m, ret=cd.ret))
+        kb.button(text="◀️ Назад", callback_data=SlotCb(action="wd", sid=cd.sid, wd=cd.wd, ret=cd.ret))
         kb.adjust(4, 1)
+    return text, kb.as_markup()
+
+
+async def render_schedule(db: DB, tutor_id: int):
+    """Экран «Расписание на неделю»: все регулярные уроки по дням и кнопки для изменения."""
+    rows = await db.week_template(tutor_id)
+    students = await db.students_with_balance(tutor_id, now())
+    lines = ["🕒 <b>Расписание на неделю</b>", HINT.format("Регулярные уроки — повторяются каждую неделю"), ""]
+    kb = InlineKeyboardBuilder()
+    kb.button(text="➕ Добавить урок", callback_data=PickCb(ret="sched"))
+    if not students:
+        lines.append("Учеников пока нет. Сначала добавь ученика, потом — его уроки.")
+    elif not rows:
+        lines.append("Регулярных уроков пока нет.\n\nНажми «➕ Добавить урок»: выбери ученика, день и время.")
+    else:
+        for wd in range(7):
+            day_rows = [r for r in rows if r["weekday"] == wd]
+            if not day_rows:
+                continue
+            lines.append(f"<b>{WEEKDAYS_FULL[wd].capitalize()}</b>")
+            lines += [f"   {lesson_line(r)}" for r in day_rows]
+            lines.append("")
+        lines.append(HINT.format("🕒 Имя — изменить или удалить уроки ученика"))
+    with_slots = list(dict.fromkeys((r["student_id"], r["name"]) for r in rows))
+    for sid, name in with_slots:
+        kb.button(text=f"🕒 {name}", callback_data=SlotCb(action="edit", sid=sid))
+    kb.button(text="➕ Новый ученик", callback_data=StudentCb(action="new", id=0))
+    n = len(with_slots)
+    kb.adjust(1, *([2] * (n // 2)), *([1] if n % 2 else []), 1)
+    return "\n".join(lines).rstrip(), kb.as_markup()
+
+
+async def render_pick(db: DB, tutor_id: int, cd: PickCb):
+    """Выбор ученика для нового регулярного урока."""
+    students = await db.students_with_balance(tutor_id, now())
+    kb = InlineKeyboardBuilder()
+    if cd.wd >= 0:
+        text = f"➕ <b>Новый урок по {WEEKDAYS_PLURAL_DAT[cd.wd]}</b>\n\n"
+    else:
+        text = "➕ <b>Новый урок</b>\n\n"
+    if students:
+        text += "Для какого ученика?"
+        for st in students:
+            action = "wd" if cd.wd >= 0 else "add"
+            kb.button(text=st["name"], callback_data=SlotCb(action=action, sid=st["id"], wd=cd.wd, ret=cd.ret))
+    else:
+        text += "Учеников пока нет — сначала добавь ученика."
+    kb.button(text="➕ Новый ученик", callback_data=StudentCb(action="new", id=0))
+    kb.button(text="◀️ Назад", callback_data=SchedCb() if cd.ret == "sched" else DayCb(day=cd.ret))
+    n = len(students)
+    kb.adjust(*([2] * (n // 2)), *([1] if n % 2 else []), 1, 1)
     return text, kb.as_markup()
 
 
@@ -394,7 +483,9 @@ async def render_students(db: DB, tutor_id: int):
         subject = f" · <i>{escape(s['subject'])}</i>" if s["subject"] else ""
         lines.append(f"<b>{escape(s['name'])}</b>{subject} — {info}")
         kb.button(text=s["name"], callback_data=StudentCb(action="open", id=s["id"]))
-    kb.adjust(2)
+    kb.button(text="➕ Новый ученик", callback_data=StudentCb(action="new", id=0))
+    n = len(students)
+    kb.adjust(*([2] * (n // 2)), *([1] if n % 2 else []), 1)
 
     if totals:
         lines += ["", "💰 <b>За неделю по расписанию</b>"]
@@ -444,12 +535,13 @@ async def cmd_start(msg: Message, db: DB, state: FSMContext):
         "<b>С чего начать:</b>\n"
         f"1. Нажми «{BTN_ADD}» и добавь ученика.\n"
         "2. Отметь кнопками, в какие дни и во сколько у вас уроки.\n"
-        f"3. Готово! Расписание — в «{BTN_TODAY}» и «{BTN_WEEK}».\n\n"
+        f"3. Готово! Все уроки — в «{BTN_SCHEDULE}», ближайшие — в «{BTN_TODAY}» и «{BTN_WEEK}».\n\n"
         f"{digest}\n"
         f"🌍 Часовой пояс: {tz_label(t['tz'])}\n"
-        f"<i>Сводка и часовой пояс настраиваются в «{BTN_SETTINGS}».</i>",
+        f"<i>Сводка и часовой пояс настраиваются в «{BTN_SETTINGS}». Подсказки — /help</i>",
         reply_markup=main_kb(),
     )
+    await db.set_kb_version(msg.from_user.id, MENU_VERSION)
 
 
 @router.message(Command("cancel"))
@@ -505,6 +597,19 @@ async def menu_students(msg: Message, db: DB, state: FSMContext):
     await state.clear()
     text, kb = await render_students(db, msg.from_user.id)
     await msg.answer(text, reply_markup=kb)
+
+
+@router.message(F.text == BTN_SCHEDULE)
+async def menu_schedule(msg: Message, db: DB, state: FSMContext):
+    await state.clear()
+    text, kb = await render_schedule(db, msg.from_user.id)
+    await msg.answer(text, reply_markup=kb)
+
+
+@router.message(Command("help"))
+async def cmd_help(msg: Message, state: FSMContext):
+    await state.clear()
+    await msg.answer(HELP_TEXT, reply_markup=help_kb())
 
 
 @router.message(F.text == BTN_SETTINGS)
@@ -732,6 +837,13 @@ async def cb_student(cb: CallbackQuery, callback_data: StudentCb, db: DB, state:
     await state.clear()  # ветки ниже при необходимости задают новый шаг ввода
     action, sid = callback_data.action, callback_data.id
 
+    if action == "new":
+        await db.ensure_tutor(cb.from_user.id, now().date())
+        await state.set_state(AddStudent.name)
+        await cb.message.answer("Как зовут ученика?")
+        await cb.answer()
+        return
+
     if action == "list":
         text, kb = await render_students(db, cb.from_user.id)
         await safe_edit(cb, text, reply_markup=kb)
@@ -821,9 +933,30 @@ async def cb_slots(cb: CallbackQuery, callback_data: SlotCb, db: DB, state: FSMC
         added = await db.add_slot(cd.sid, cd.wd, t, now())
         note = f"Добавлено: {WEEKDAYS[cd.wd]} {t}" if added else "Такой урок уже есть"
 
-    text, kb = await render_slot_editor(db, cb.from_user.id, cd.sid)
+    if cd.action == "m" and cd.ret == "sched":
+        text, kb = await render_schedule(db, cb.from_user.id)
+    elif cd.action == "m" and cd.ret:
+        text, kb = await render_day(db, cb.from_user.id, date.fromisoformat(cd.ret))
+    else:
+        text, kb = await render_slot_editor(db, cb.from_user.id, cd.sid)
     await safe_edit(cb, text, reply_markup=kb)
     await cb.answer(note)
+
+
+@router.callback_query(PickCb.filter())
+async def cb_pick(cb: CallbackQuery, callback_data: PickCb, db: DB, state: FSMContext):
+    await state.clear()
+    text, kb = await render_pick(db, cb.from_user.id, callback_data)
+    await safe_edit(cb, text, reply_markup=kb)
+    await cb.answer()
+
+
+@router.callback_query(SchedCb.filter())
+async def cb_schedule(cb: CallbackQuery, db: DB, state: FSMContext):
+    await state.clear()
+    text, kb = await render_schedule(db, cb.from_user.id)
+    await safe_edit(cb, text, reply_markup=kb)
+    await cb.answer()
 
 
 # ================= настройки =================
@@ -1077,7 +1210,55 @@ async def ask_name(msg: Message, db: DB, state: FSMContext):
 
 # ================= всё остальное =================
 
+HELP_TEXT = (
+    "❓ <b>Как пользоваться ботом</b>\n\n"
+    f"<b>{BTN_SCHEDULE}</b> — все регулярные уроки на неделю. Чтобы добавить урок: "
+    "«➕ Добавить урок» → ученик → день → время.\n\n"
+    f"<b>{BTN_TODAY}</b>, <b>{BTN_TOMORROW}</b>, <b>{BTN_WEEK}</b> — ближайшие уроки. "
+    "Нажми на урок, чтобы перенести, отменить его или отправить напоминание ученику. "
+    "«➕ Урок» в экране дня добавляет регулярный урок в этот день недели.\n\n"
+    f"<b>{BTN_ADD}</b> — добавить ученика: имя, предмет, контакт, стоимость, длительность урока.\n\n"
+    f"<b>{BTN_STUDENTS}</b> — карточки учеников: расписание, предмет, стоимость, телефон.\n\n"
+    f"<b>{BTN_SETTINGS}</b> — утренняя сводка и часовой пояс."
+)
+
+
+def help_kb():
+    kb = InlineKeyboardBuilder()
+    kb.button(text=BTN_SCHEDULE, callback_data=SchedCb())
+    kb.button(text=BTN_ADD, callback_data=StudentCb(action="new", id=0))
+    kb.adjust(2)
+    return kb.as_markup()
+
+
+async def forward_to_admin(msg: Message):
+    """Пересылка непонятого сообщения владельцу бота вместе с готовой командой для ответа."""
+    if not ADMIN_ID or msg.from_user.id == ADMIN_ID:
+        return
+    u = msg.from_user
+    nick = f"@{u.username}" if u.username else "без ника"
+    body = escape(msg.text) if msg.text else f"<i>{msg.content_type}</i>"
+    try:
+        await msg.bot.send_message(
+            ADMIN_ID,
+            f"✉️ <b>Сообщение от пользователя</b>\n{escape(u.full_name)} ({nick}, id={u.id})\n\n{body}\n\n"
+            f"Ответить: <code>/reply {u.id} </code>",
+        )
+        if not msg.text:
+            await msg.copy_to(ADMIN_ID)  # фото, голосовое и т.п. — копия оригинала
+    except Exception:
+        logging.getLogger("actions").exception("Не удалось переслать сообщение владельцу")
+
+
 @router.message()
 async def fallback(msg: Message):
-    """Ответ на неизвестный текст (например, кнопку из старой версии меню): отправка актуального меню."""
-    await msg.answer("Не понял 🤔 Выбери действие в меню ниже.", reply_markup=main_kb())
+    """Ответ на сообщение, которое бот не распознал: подсказка с кнопками и пересылка владельцу."""
+    await msg.answer(
+        "Я понимаю кнопки 🙂 Главное:\n\n"
+        f"<b>{BTN_SCHEDULE}</b> — все уроки на неделю, там же «➕ Добавить урок».\n"
+        f"<b>{BTN_TODAY}</b> / <b>{BTN_WEEK}</b> — ближайшие уроки: нажми на урок, чтобы перенести или отменить.\n\n"
+        "Все подсказки — /help\n"
+        + (HINT.format("Сообщение передано разработчику.") if ADMIN_ID else ""),
+        reply_markup=help_kb(),
+    )
+    await forward_to_admin(msg)
